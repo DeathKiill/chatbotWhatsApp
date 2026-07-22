@@ -183,10 +183,13 @@ def save_answers(from_number: str, answers: dict):
     if GOOGLE_SCRIPT_URL:
         try:
             sync_to_google_sheet(from_number, answers)
+            logger.info("Respostas de %s sincronizadas com o Google Sheets", from_number)
         except Exception:
             # Falha ao espelhar no Sheets não deve derrubar o fluxo: os dados
             # já estão seguros no Supabase.
             logger.exception("Falha ao sincronizar com o Google Sheets (dados já salvos no Supabase)")
+    else:
+        logger.info("GOOGLE_SCRIPT_URL não configurado - pulando sincronização com o Sheets")
 
 
 def save_to_supabase(from_number: str, answers: dict):
