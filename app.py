@@ -18,6 +18,43 @@ GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v20.0")
 
 GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{PHONE_NUMBER_ID}/messages"
 
+# ---------------------------------------------------------------------------
+# Configuração do Supabase (armazenamento principal das respostas)
+# ---------------------------------------------------------------------------
+SUPABASE_URL = os.environ["SUPABASE_URL"]                 # ex: https://xxxx.supabase.co
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]  # service_role key (Settings > API no Supabase)
+SUPABASE_TABLE = os.environ.get("SUPABASE_TABLE", "form_responses")
+
+SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
+
+# ---------------------------------------------------------------------------
+# Configuração do Google Apps Script (espelha as respostas numa planilha)
+# Opcional: se GOOGLE_SCRIPT_URL não estiver definido, o bot só usa Supabase.
+# ---------------------------------------------------------------------------
+GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")  # URL do Web App do Apps Script
+GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")  # mesma string usada no script
+
+
+# ---------------------------------------------------------------------------
+# Definição do formulário/questionário
+# ---------------------------------------------------------------------------
+# Cada pergunta tem uma "key" (usada como coluna na tabela/planilha) e o texto
+# enviado ao usuário. Adicione, remova ou reordene à vontade.
+QUESTIONS = [
+    {"key": "nome", "prompt": "Qual é o seu nome completo?"},
+    {"key": "email", "prompt": "Qual é o seu e-mail?"},
+    {"key": "cidade", "prompt": "Em qual cidade você mora?"},
+]
+
+TRIGGER_WORDS = ("formulario", "questionario", "form", "cadastro")
+CANCEL_WORDS = ("cancelar", "sair", "parar")
+
+# Estado das conversas em andamento: { numero: {"step": int, "answers": {...}} }
+# ATENÇÃO: isso vive na memória do processo. Se o Render reiniciar o serviço
+# ou rodar mais de 1 worker do gunicorn, o estado se perde/duplica.
+# Seu Start Command já usa "-w 1" (1 worker), então está correto.
+conversation_state = {}
+
 
 # ---------------------------------------------------------------------------
 # Verificação do webhook (GET) - a Meta chama isso uma vez ao configurar
@@ -73,24 +110,120 @@ def receive_webhook():
 
 
 # ---------------------------------------------------------------------------
-# Lógica do bot (troque isso pela sua lógica real: Supabase, planos, etc.)
+# Lógica do bot
 # ---------------------------------------------------------------------------
 def handle_text_message(from_number: str, text: str):
-    text_lower = text.strip().lower()
+    text_stripped = text.strip()
+    text_lower = text_stripped.lower()
 
-    if text_lower in ("oi", "ola", "olá", "start", "menu"):
+    # Usuário já está no meio do formulário
+    if from_number in conversation_state:
+        if text_lower in CANCEL_WORDS:
+            conversation_state.pop(from_number, None)
+            send_text_message(from_number, "Ok, cancelei o preenchimento. Digite *formulario* quando quiser recomeçar.")
+            return
+        handle_form_answer(from_number, text_stripped)
+        return
+
+    if text_lower in TRIGGER_WORDS:
+        start_form(from_number)
+    elif text_lower in ("oi", "ola", "olá", "start", "menu"):
         send_text_message(
             from_number,
             "Olá! 👋 Eu sou o bot. Digite:\n"
             "1 - Ver planos\n"
-            "2 - Falar com suporte",
+            "2 - Falar com suporte\n"
+            "3 - Preencher formulário",
         )
     elif text_lower == "1":
         send_text_message(from_number, "Aqui estão nossos planos... (placeholder)")
     elif text_lower == "2":
         send_text_message(from_number, "Encaminhando para o suporte... (placeholder)")
+    elif text_lower == "3":
+        start_form(from_number)
     else:
         send_text_message(from_number, f"Recebi: {text}")
+
+
+def start_form(from_number: str):
+    conversation_state[from_number] = {"step": 0, "answers": {}}
+    send_text_message(from_number, "Vamos preencher o formulário! Você pode digitar *cancelar* a qualquer momento.")
+    send_text_message(from_number, QUESTIONS[0]["prompt"])
+
+
+def handle_form_answer(from_number: str, answer: str):
+    state = conversation_state[from_number]
+    step = state["step"]
+    key = QUESTIONS[step]["key"]
+    state["answers"][key] = answer
+
+    next_step = step + 1
+
+    if next_step < len(QUESTIONS):
+        state["step"] = next_step
+        send_text_message(from_number, QUESTIONS[next_step]["prompt"])
+    else:
+        # Última pergunta respondida: salva na planilha e encerra
+        conversation_state.pop(from_number, None)
+        try:
+            save_answers(from_number, state["answers"])
+            send_text_message(from_number, "Obrigado! Suas respostas foram registradas com sucesso. ✅")
+        except Exception:
+            logger.exception("Erro ao salvar respostas de %s", from_number)
+            send_text_message(
+                from_number,
+                "Recebi suas respostas, mas houve um erro ao salvar. Nossa equipe já foi avisada.",
+            )
+
+
+def save_answers(from_number: str, answers: dict):
+    """Salva as respostas no Supabase e, se configurado, espelha na planilha do Google."""
+    save_to_supabase(from_number, answers)
+
+    if GOOGLE_SCRIPT_URL:
+        try:
+            sync_to_google_sheet(from_number, answers)
+        except Exception:
+            # Falha ao espelhar no Sheets não deve derrubar o fluxo: os dados
+            # já estão seguros no Supabase.
+            logger.exception("Falha ao sincronizar com o Google Sheets (dados já salvos no Supabase)")
+
+
+def save_to_supabase(from_number: str, answers: dict):
+    from datetime import datetime, timezone
+
+    row = {
+        "whatsapp_number": from_number,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        **answers,
+    }
+
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    resp = requests.post(SUPABASE_REST_URL, headers=headers, json=row, timeout=10)
+
+    if resp.status_code not in (200, 201):
+        raise RuntimeError(f"Erro ao salvar no Supabase: {resp.status_code} - {resp.text}")
+
+
+def sync_to_google_sheet(from_number: str, answers: dict):
+    from datetime import datetime, timezone
+
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "numero_whatsapp": from_number,
+        **answers,
+        "secret": GOOGLE_SCRIPT_SECRET,
+    }
+    resp = requests.post(GOOGLE_SCRIPT_URL, json=payload, timeout=10)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"Erro ao chamar o Apps Script: {resp.status_code} - {resp.text}")
 
 
 # ---------------------------------------------------------------------------
