@@ -97,8 +97,15 @@ def receive_webhook():
         if msg_type == "text":
             text_body = message["text"]["body"]
             handle_text_message(from_number, text_body)
+        elif msg_type == "interactive":
+            interactive = message.get("interactive", {})
+            if interactive.get("type") == "button_reply":
+                button_id = interactive["button_reply"]["id"]
+                handle_button_reply(from_number, button_id)
+            else:
+                logger.info("Tipo de interactive não tratado: %s", interactive.get("type"))
         else:
-            # outros tipos: image, audio, interactive (botões/listas), location, etc.
+            # outros tipos: image, audio, location, etc.
             logger.info("Tipo de mensagem não tratado: %s", msg_type)
             send_text_message(from_number, "Por enquanto só entendo mensagens de texto 🙂")
 
@@ -112,18 +119,35 @@ def receive_webhook():
 # ---------------------------------------------------------------------------
 # Lógica do bot
 # ---------------------------------------------------------------------------
+# O formulário agora tem 3 estágios (guardados em state["stage"]):
+#   "country"   -> pergunta com botões: Brasil ou Estrangeiro
+#   "document"  -> pergunta de texto livre: CPF (se Brasil) ou Passaporte (se Estrangeiro)
+#   "questions" -> segue a lista QUESTIONS (nome, email, cidade) normalmente
 def handle_text_message(from_number: str, text: str):
     text_stripped = text.strip()
     text_lower = text_stripped.lower()
 
     # Usuário já está no meio do formulário
     if from_number in conversation_state:
+        state = conversation_state[from_number]
+
         if text_lower in CANCEL_WORDS:
             conversation_state.pop(from_number, None)
             send_text_message(from_number, "Ok, cancelei o preenchimento. Digite *formulario* quando quiser recomeçar.")
             return
-        handle_form_answer(from_number, text_stripped)
-        return
+
+        if state["stage"] == "country":
+            # Esperávamos um clique no botão, não texto livre
+            send_text_message(from_number, "Por favor, toque em um dos botões acima: Brasil ou Estrangeiro.")
+            return
+
+        if state["stage"] == "document":
+            handle_document_answer(from_number, text_stripped)
+            return
+
+        if state["stage"] == "questions":
+            handle_form_answer(from_number, text_stripped)
+            return
 
     if text_lower in TRIGGER_WORDS:
         start_form(from_number)
@@ -146,8 +170,48 @@ def handle_text_message(from_number: str, text: str):
 
 
 def start_form(from_number: str):
-    conversation_state[from_number] = {"step": 0, "answers": {}}
+    conversation_state[from_number] = {"stage": "country", "answers": {}}
     send_text_message(from_number, "Vamos preencher o formulário! Você pode digitar *cancelar* a qualquer momento.")
+    send_button_message(
+        from_number,
+        body_text="Você é do Brasil ou estrangeiro?",
+        buttons=[
+            {"id": "pais_brasil", "title": "Brasil"},
+            {"id": "pais_estrangeiro", "title": "Estrangeiro"},
+        ],
+    )
+
+
+def handle_button_reply(from_number: str, button_id: str):
+    state = conversation_state.get(from_number)
+
+    if not state or state.get("stage") != "country":
+        # Clique em botão fora do contexto esperado (ex: mensagem antiga, reenvio)
+        logger.info("Clique em botão ignorado (fora de contexto) de %s: %s", from_number, button_id)
+        return
+
+    if button_id == "pais_brasil":
+        state["answers"]["pais"] = "Brasil"
+        state["stage"] = "document"
+        state["document_key"] = "cpf"
+        send_text_message(from_number, "Informe seu CPF:")
+    elif button_id == "pais_estrangeiro":
+        state["answers"]["pais"] = "Estrangeiro"
+        state["stage"] = "document"
+        state["document_key"] = "passaporte"
+        send_text_message(from_number, "Informe o número do seu passaporte:")
+    else:
+        logger.warning("ID de botão desconhecido recebido de %s: %s", from_number, button_id)
+
+
+def handle_document_answer(from_number: str, answer: str):
+    state = conversation_state[from_number]
+    key = state.pop("document_key")
+    state["answers"][key] = answer
+
+    # Segue para a lista normal de perguntas (nome, email, cidade...)
+    state["stage"] = "questions"
+    state["step"] = 0
     send_text_message(from_number, QUESTIONS[0]["prompt"])
 
 
@@ -163,7 +227,7 @@ def handle_form_answer(from_number: str, answer: str):
         state["step"] = next_step
         send_text_message(from_number, QUESTIONS[next_step]["prompt"])
     else:
-        # Última pergunta respondida: salva na planilha e encerra
+        # Última pergunta respondida: salva e encerra
         conversation_state.pop(from_number, None)
         try:
             save_answers(from_number, state["answers"])
@@ -250,6 +314,45 @@ def send_text_message(to: str, body: str):
         logger.error("Erro ao enviar mensagem: %s - %s", resp.status_code, resp.text)
     else:
         logger.info("Mensagem enviada para %s", to)
+
+    return resp
+
+
+def send_button_message(to: str, body_text: str, buttons: list):
+    """
+    Envia uma mensagem com até 3 botões de resposta rápida.
+    `buttons` é uma lista de dicts: [{"id": "...", "title": "..."}, ...]
+    O título de cada botão tem limite de 20 caracteres (regra da própria API do WhatsApp).
+    """
+    if len(buttons) > 3:
+        raise ValueError("A API do WhatsApp permite no máximo 3 botões por mensagem.")
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body_text},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
+                    for b in buttons
+                ]
+            },
+        },
+    }
+
+    resp = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=10)
+
+    if resp.status_code != 200:
+        logger.error("Erro ao enviar botões: %s - %s", resp.status_code, resp.text)
+    else:
+        logger.info("Botões enviados para %s", to)
 
     return resp
 
