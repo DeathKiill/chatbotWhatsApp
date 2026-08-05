@@ -34,6 +34,16 @@ SUPABASE_REST_URL = f"{SUPABASE_URL}/rest/v1/{SUPABASE_TABLE}"
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")  # URL do Web App do Apps Script
 GOOGLE_SCRIPT_SECRET = os.environ.get("GOOGLE_SCRIPT_SECRET")  # mesma string usada no script
 
+# ---------------------------------------------------------------------------
+# Vídeo enviado após a conclusão do formulário (opcional)
+# Prefira WHATSAPP_VIDEO_MEDIA_ID (upload feito uma vez para a Meta).
+# Se não tiver, dá pra usar WHATSAPP_VIDEO_URL (link público direto do vídeo).
+# Se nenhuma das duas estiver definida, o bot simplesmente não envia vídeo.
+# ---------------------------------------------------------------------------
+WHATSAPP_VIDEO_MEDIA_ID = os.environ.get("WHATSAPP_VIDEO_MEDIA_ID")
+WHATSAPP_VIDEO_URL = os.environ.get("WHATSAPP_VIDEO_URL")
+VIDEO_CAPTION = "Obrigado por preencher o formulário! Assista esse vídeo 🎬"
+
 
 # ---------------------------------------------------------------------------
 # Definição do formulário/questionário
@@ -232,6 +242,7 @@ def handle_form_answer(from_number: str, answer: str):
         try:
             save_answers(from_number, state["answers"])
             send_text_message(from_number, "Obrigado! Suas respostas foram registradas com sucesso. ✅")
+            send_completion_video(from_number)
         except Exception:
             logger.exception("Erro ao salvar respostas de %s", from_number)
             send_text_message(
@@ -353,6 +364,55 @@ def send_button_message(to: str, body_text: str, buttons: list):
         logger.error("Erro ao enviar botões: %s - %s", resp.status_code, resp.text)
     else:
         logger.info("Botões enviados para %s", to)
+
+    return resp
+
+
+def send_completion_video(from_number: str):
+    """Envia o vídeo de agradecimento, se um media_id ou URL estiver configurado."""
+    try:
+        if WHATSAPP_VIDEO_MEDIA_ID:
+            send_video_message(from_number, media_id=WHATSAPP_VIDEO_MEDIA_ID, caption=VIDEO_CAPTION)
+        elif WHATSAPP_VIDEO_URL:
+            send_video_message(from_number, link=WHATSAPP_VIDEO_URL, caption=VIDEO_CAPTION)
+        else:
+            logger.info("Nenhum vídeo configurado (WHATSAPP_VIDEO_MEDIA_ID / WHATSAPP_VIDEO_URL) - pulando envio.")
+    except Exception:
+        # Falha ao mandar o vídeo não deve derrubar o fluxo: as respostas já foram salvas.
+        logger.exception("Erro ao enviar vídeo de conclusão para %s", from_number)
+
+
+def send_video_message(to: str, caption: str = "", media_id: str = None, link: str = None):
+    """
+    Envia um vídeo. Use `media_id` (preferido, upload já feito para a Meta)
+    ou `link` (URL pública direta do arquivo de vídeo).
+    """
+    if not media_id and not link:
+        raise ValueError("É preciso informar media_id ou link.")
+
+    video_payload = {"caption": caption}
+    if media_id:
+        video_payload["id"] = media_id
+    else:
+        video_payload["link"] = link
+
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "video",
+        "video": video_payload,
+    }
+
+    resp = requests.post(GRAPH_URL, headers=headers, json=payload, timeout=15)
+
+    if resp.status_code != 200:
+        logger.error("Erro ao enviar vídeo: %s - %s", resp.status_code, resp.text)
+    else:
+        logger.info("Vídeo enviado para %s", to)
 
     return resp
 
