@@ -195,7 +195,7 @@ def receive_webhook():
 
             if interactive_type == "button_reply":
                 button_id = interactive["button_reply"]["id"]
-                handle_screening_reply(from_number, button_id)
+                handle_button_reply(from_number, button_id)
             elif interactive_type == "list_reply":
                 row_id = interactive["list_reply"]["id"]
                 row_title = interactive["list_reply"]["title"]
@@ -256,6 +256,13 @@ def handle_text_message(from_number: str, text: str):
 
 
 def start_screening(from_number: str):
+    if has_existing_response(from_number):
+        send_text_message(
+            from_number,
+            "Você já respondeu a esta pesquisa anteriormente. Obrigado pela sua participação! 🙏",
+        )
+        return
+
     conversation_state[from_number] = {"stage": "screening", "step": 0, "answers": {}}
     send_text_message(from_number, "Vamos começar! Você pode digitar *cancelar* a qualquer momento.")
     ask_screening_question(from_number, 0)
@@ -270,13 +277,23 @@ def ask_screening_question(from_number: str, step: int):
     )
 
 
-def handle_screening_reply(from_number: str, button_id: str):
+def handle_button_reply(from_number: str, button_id: str):
     state = conversation_state.get(from_number)
 
-    if not state or state.get("stage") != "screening":
+    if not state:
         logger.info("Clique em botão ignorado (fora de contexto) de %s: %s", from_number, button_id)
         return
 
+    if state.get("stage") == "screening":
+        handle_screening_reply(from_number, button_id)
+    elif state.get("stage") == "confirm":
+        handle_confirm_reply(from_number, button_id)
+    else:
+        logger.info("Clique em botão ignorado (estágio '%s') de %s: %s", state.get("stage"), from_number, button_id)
+
+
+def handle_screening_reply(from_number: str, button_id: str):
+    state = conversation_state[from_number]
     step = state["step"]
     question = SCREENING_QUESTIONS[step]
 
@@ -288,7 +305,7 @@ def handle_screening_reply(from_number: str, button_id: str):
     state["answers"][question["key"]] = option["title"]
 
     if option["exclude"]:
-        finish_as_excluded(from_number, state, failed_question_key=question["key"])
+        ask_confirmation(from_number, action="exclude", failed_question_key=question["key"])
         return
 
     next_step = step + 1
@@ -297,10 +314,57 @@ def handle_screening_reply(from_number: str, button_id: str):
         state["step"] = next_step
         ask_screening_question(from_number, next_step)
     else:
-        # Passou em todos os critérios: manda o vídeo e parte pro agendamento
+        # Respondeu todas as perguntas sem ser excluído: confirma antes de seguir
+        ask_confirmation(from_number, action="complete")
+
+
+def ask_confirmation(from_number: str, action: str, failed_question_key: str = None):
+    state = conversation_state[from_number]
+    state["stage"] = "confirm"
+    state["confirm_action"] = action
+    if failed_question_key:
+        state["failed_question_key"] = failed_question_key
+
+    send_button_message(
+        from_number,
+        body_text="Agradecemos por responder a pesquisa! Você confirma o envio das suas respostas?",
+        buttons=[
+            {"id": "confirm_sim", "title": "Sim"},
+            {"id": "confirm_nao", "title": "Não"},
+        ],
+    )
+
+
+def handle_confirm_reply(from_number: str, button_id: str):
+    state = conversation_state.get(from_number)
+
+    if not state or state.get("stage") != "confirm":
+        logger.info("Confirmação ignorada (fora de contexto) de %s: %s", from_number, button_id)
+        return
+
+    if button_id == "confirm_nao":
+        # Descarta as respostas dadas e recomeça do zero
+        conversation_state[from_number] = {"stage": "screening", "step": 0, "answers": {}}
+        send_text_message(from_number, "Sem problemas! Vamos recomeçar a pesquisa desde o início.")
+        ask_screening_question(from_number, 0)
+        return
+
+    if button_id != "confirm_sim":
+        logger.warning("ID de confirmação desconhecido recebido de %s: %s", from_number, button_id)
+        return
+
+    action = state.get("confirm_action")
+
+    if action == "exclude":
+        finish_as_excluded(from_number, state, failed_question_key=state.get("failed_question_key"))
+    elif action == "complete":
+        # Confirmado: segue para o vídeo e o agendamento (o salvamento final
+        # acontece quando a pessoa escolher o horário da consulta)
         state["stage"] = "scheduling"
         send_completion_video(from_number)
         send_appointment_list(from_number)
+    else:
+        logger.warning("Ação de confirmação desconhecida para %s: %s", from_number, action)
 
 
 def finish_as_excluded(from_number: str, state: dict, failed_question_key: str):
@@ -353,6 +417,29 @@ def handle_appointment_reply(from_number: str, row_id: str, row_title: str):
             from_number,
             "Recebemos sua escolha de horário, mas houve um erro ao salvar. Nossa equipe já foi avisada.",
         )
+
+
+def has_existing_response(from_number: str) -> bool:
+    """Verifica no Supabase se esse número já tem alguma resposta registrada."""
+    headers = {
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    }
+    params = {
+        "whatsapp_number": f"eq.{from_number}",
+        "select": "id",
+        "limit": "1",
+    }
+
+    resp = requests.get(SUPABASE_REST_URL, headers=headers, params=params, timeout=10)
+
+    if resp.status_code != 200:
+        # Se a checagem falhar, é mais seguro deixar responder do que travar
+        # o fluxo por um erro de rede/consulta - mas registramos o problema.
+        logger.error("Erro ao checar resposta existente: %s - %s", resp.status_code, resp.text)
+        return False
+
+    return len(resp.json()) > 0
 
 
 def save_answers(from_number: str, answers: dict):
