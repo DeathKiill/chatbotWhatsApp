@@ -240,16 +240,16 @@ def handle_text_message(from_number: str, text: str):
     elif text_lower in ("oi", "ola", "olá", "start", "menu"):
         send_text_message(
             from_number,
-            "Olá! 👋 Eu sou o bot. Digite:\n"
-            "1 - Ver planos\n"
-            "2 - Falar com suporte\n"
-            "3 - Participar da pesquisa",
+            "Olá! 👋 Eu sou o Robô de Pesquisas da Odontopediatria da FOUERJ\n"
+            "Abaixo digite a opção de pesquisa para inciciar o questionário\n"
+            "Digite:\n"
+            "1 - Pesquisa",
         )
+    #elif text_lower == "1":
+    #    send_text_message(from_number, "Aqui estão nossos planos... (placeholder)")
+    #elif text_lower == "2":
+    #    send_text_message(from_number, "Encaminhando para o suporte... (placeholder)")
     elif text_lower == "1":
-        send_text_message(from_number, "Aqui estão nossos planos... (placeholder)")
-    elif text_lower == "2":
-        send_text_message(from_number, "Encaminhando para o suporte... (placeholder)")
-    elif text_lower == "3":
         start_screening(from_number)
     else:
         send_text_message(from_number, f"Recebi: {text}")
